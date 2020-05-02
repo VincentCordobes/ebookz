@@ -5,21 +5,14 @@ import path from 'path';
 import AdmZip from 'adm-zip';
 
 const tmpDir = path.join(__dirname, '../tmp');
-const nick = 'Vincent123' + Math.floor(Math.random() * 10);
+const nick = 'toto' + Math.floor(Math.random() * 100);
 const client = new irc.Client('irc.irchighway.net', nick, {
+  userName: 'tat',
   port: 6667,
   channels: ['#ebooks'],
 });
 
-type Result<T, E> =
-  | {
-      ok: true;
-      value: T;
-    }
-  | {
-      ok: false;
-      error: E;
-    };
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
 type DCCService = {
   type: 'SEND';
@@ -39,7 +32,7 @@ function uint32ToIP(n: number): string {
 
 // message: DCC SEND SearchBot_results_for__La_promesse_de_l_aube.txt.zip 2907707975 4529 756
 function parseDCC(text: string): Result<DCCService, string> {
-  const result = text.match(/(?:\S)+/g);
+  const result = text.match(/([^"\s]|"[^"]+")+/g);
   if (!result) {
     return { ok: false, error: 'Not a DCC command' };
   }
@@ -52,14 +45,15 @@ function parseDCC(text: string): Result<DCCService, string> {
   const isValidService = (raw: string): raw is 'SEND' => ['SEND'].includes(raw);
 
   if (!isValidService(type)) {
-    return { ok: false, error: `${type} is not a valid DCC service` };
+    console.log('Unknown DCC message', { type });
+    return { ok: false, error: 'Unknown DCC message' };
   }
 
   return {
     ok: true,
     value: {
       type,
-      file,
+      file: file.replace(/"/g, ''),
       ip: uint32ToIP(Number(ip)),
       port: Number(port),
       length: Number(length),
@@ -69,7 +63,7 @@ function parseDCC(text: string): Result<DCCService, string> {
 
 function log(from: string, to: string, message: string) {
   if (to === nick) {
-    console.log(from + ' => ' + to + ' : ' + message);
+    console.log(from + ': ' + message);
   }
 }
 
@@ -78,7 +72,8 @@ type DownloadParams = {
   ip: string;
   port: number;
 };
-function downloadSearchFile({ file, ip, port }: DownloadParams) {
+function download({ file, ip, port }: DownloadParams): Promise<void> {
+  console.log('Downloading file...');
   return new Promise((resolve, reject) => {
     const writeSteam = fs.createWriteStream(path.join(tmpDir, file));
 
@@ -90,64 +85,74 @@ function downloadSearchFile({ file, ip, port }: DownloadParams) {
 
     socket.on('data', data => {
       received += data.length;
-
-      console.log('writing data', { received });
       writeSteam.write(data);
-
       client.emit('xdcc-data', received);
-
       buf.writeUInt32BE(received, 0);
       socket.write(buf);
     });
 
     socket.on('end', () => {
-      console.log('socket end', { received });
+      console.log('File successfully downloaded', { received });
       writeSteam.end();
       client.emit('xdcc-end');
       resolve();
     });
 
     socket.on('error', err => {
+      console.error(err);
       writeSteam.end();
       client.emit('xdcc-error', err);
-      console.error(err);
       reject();
     });
   });
 }
 
-function getSearchContent(archive: string): string[] {
+function getSearchResult(archive: string): string[] {
   const zip = new AdmZip(archive);
   const [entry] = zip.getEntries();
-
-  return zip
-    .readAsText(entry.entryName)
+  const rawText = zip.readAsText(entry.entryName);
+  console.log('Archive content', { rawText });
+  return rawText
     .split('\n')
     .map(line => line.match(/^!.*.epub/))
     .filter(Boolean)
     .map(match => match![0]);
 }
 
+async function handleSearch({ file, ip, port }: DownloadParams) {
+  await download({ file, ip, port });
+  const commands = getSearchResult(path.join(tmpDir, file));
+
+  console.log(commands);
+  commands.forEach(command => client.say('#ebooks', command));
+}
+
 client.addListener('message', (from, to, message) => {
   log(from, to, message);
 });
 
-client.on('ctcp-privmsg', async (from, to, message) => {
-  const dccResult = parseDCC(message);
+client.on('ctcp-privmsg', (from, to, message) => {
   log(from, to, message);
+
+  const dccResult = parseDCC(message);
 
   if (!dccResult.ok) return;
 
-  console.log('DCC successfully parsed', dccResult);
-
-  await downloadSearchFile(dccResult.value);
-
-  const commands = getSearchContent(path.join(tmpDir, dccResult.value.file));
-  console.log(commands);
+  if (from === 'Search') {
+    console.log('Handling search result...');
+    return handleSearch(dccResult.value);
+  }
+  return download(dccResult.value);
 });
 
 console.log('Waiting 2s before search...');
 
+function performSearch(text: string): void {
+  console.log('Searching', text);
+  client.say('#ebooks', '@search ' + text);
+}
+
 setTimeout(() => {
-  client.say('#ebooks', "@search La promesse de l'aube");
+  performSearch("romain gary la promesse de l'aube");
+  // client.say('#ebooks', "!Horla Romain Gary - La promesse de l'aube [FR].epub");
 }, 2000);
