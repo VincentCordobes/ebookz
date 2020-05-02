@@ -6,11 +6,6 @@ import AdmZip from 'adm-zip';
 
 const tmpDir = path.join(__dirname, '../tmp');
 const nick = 'toto' + Math.floor(Math.random() * 100);
-const client = new irc.Client('irc.irchighway.net', nick, {
-  userName: 'tat',
-  port: 6667,
-  channels: ['#ebooks'],
-});
 
 type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
@@ -21,6 +16,16 @@ type DCCService = {
   port: number;
   length: number;
 };
+
+/** The irc client once registered. Call `getClient()` to use it */
+let c: irc.Client;
+
+function getClient() {
+  if (!c) {
+    throw new Error('Client not yet initialized');
+  }
+  return c;
+}
 
 function uint32ToIP(n: number): string {
   const byte1 = n & 255;
@@ -71,22 +76,23 @@ type DownloadParams = {
   file: string;
   ip: string;
   port: number;
+  length: number;
 };
-function download({ file, ip, port }: DownloadParams): Promise<void> {
-  console.log('Downloading file...');
+function download({ file, ip, port, length }: DownloadParams): Promise<void> {
+  console.log('Downloading file...', { length });
   return new Promise((resolve, reject) => {
     const writeSteam = fs.createWriteStream(path.join(tmpDir, file));
 
     let received = 0;
     const buf = Buffer.alloc(4);
     const socket = net.connect(port, ip, () => {
-      client.emit('xdcc-connect');
+      getClient().emit('xdcc-connect');
     });
 
     socket.on('data', data => {
       received += data.length;
       writeSteam.write(data);
-      client.emit('xdcc-data', received);
+      getClient().emit('xdcc-data', received);
       buf.writeUInt32BE(received, 0);
       socket.write(buf);
     });
@@ -94,14 +100,14 @@ function download({ file, ip, port }: DownloadParams): Promise<void> {
     socket.on('end', () => {
       console.log('File successfully downloaded', { received });
       writeSteam.end();
-      client.emit('xdcc-end');
+      getClient().emit('xdcc-end');
       resolve();
     });
 
     socket.on('error', err => {
       console.error(err);
       writeSteam.end();
-      client.emit('xdcc-error', err);
+      getClient().emit('xdcc-error', err);
       reject();
     });
   });
@@ -119,19 +125,24 @@ function getSearchResult(archive: string): string[] {
     .map(match => match![0]);
 }
 
-async function handleSearch({ file, ip, port }: DownloadParams) {
-  await download({ file, ip, port });
+async function handleSearch({ file, ip, port, length }: DownloadParams) {
+  await download({ file, ip, port, length });
   const commands = getSearchResult(path.join(tmpDir, file));
 
   console.log(commands);
-  commands.forEach(command => client.say('#ebooks', command));
+  commands.forEach(command => getClient().say('#ebooks', command));
 }
 
-client.addListener('message', (from, to, message) => {
-  log(from, to, message);
-});
+function performSearch(text: string): void {
+  console.log('Searching', text);
+  getClient().say('#ebooks', '@search ' + text);
+}
 
-client.on('ctcp-privmsg', (from, to, message) => {
+async function handlePrivateMessage(
+  from: string,
+  to: string,
+  message: string
+): Promise<void> {
   log(from, to, message);
 
   const dccResult = parseDCC(message);
@@ -140,19 +151,46 @@ client.on('ctcp-privmsg', (from, to, message) => {
 
   if (from === 'Search') {
     console.log('Handling search result...');
-    return handleSearch(dccResult.value);
+    handleSearch(dccResult.value);
+  } else {
+    await download(dccResult.value);
+    process.exit(0);
   }
-  return download(dccResult.value);
-});
-
-console.log('Waiting 2s before search...');
-
-function performSearch(text: string): void {
-  console.log('Searching', text);
-  client.say('#ebooks', '@search ' + text);
 }
 
-setTimeout(() => {
-  performSearch("romain gary la promesse de l'aube");
-  // client.say('#ebooks', "!Horla Romain Gary - La promesse de l'aube [FR].epub");
-}, 2000);
+function initClient(): Promise<void> {
+  return new Promise(resolve => {
+    console.log('Connecting...');
+    const client = new irc.Client('irc.irchighway.net', nick, {
+      userName: 'tat',
+      port: 6667,
+      channels: ['#ebooks'],
+    });
+
+    client.addListener('registered', message => {
+      console.log('Registered!', { message });
+      c = client;
+      resolve();
+    });
+
+    client.addListener('message', log);
+    client.on('ctcp-privmsg', handlePrivateMessage);
+  });
+}
+
+async function main() {
+  const usage = 'Usage: ebookz search';
+  const text = process.argv[2];
+
+  if (['--help', '-h'].includes(text) || !text) {
+    console.log(usage);
+    process.exit();
+  }
+
+  await initClient();
+  setTimeout(() => {
+    performSearch(text);
+  }, 1000);
+}
+
+main();
